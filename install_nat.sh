@@ -1,6 +1,29 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# --- ASCII-баннер (DenPiligrim) ---
+#################################
+# TRAP
+#################################
+trap 'echo -e "\033[1;31m[ERROR]\033[0m Ошибка в строке $LINENO"; exit 1' ERR
+
+#################################
+# HELPERS
+#################################
+log() { echo -e "\033[1;32m[INFO]\033[0m $1"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $1"; }
+die() { echo -e "\033[1;31m[ERROR]\033[0m $1"; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "Запускать нужно от root"
+
+# Check OS and set release variable
+. /etc/os-release
+if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+    die "Этот скрипт поддерживает только Ubuntu или Debian: $ID"
+fi
+
+#################################
+# ASCII-баннер
+#################################
 echo "==================================================="
 echo "    ____             ____  _ ___            _         "
 echo "   / __ \___  ____  / __ \(_) (_)___ ______(_)___ ___ "
@@ -9,152 +32,127 @@ echo " / /_/ /  __/ / / / ____/ / / / /_/ / /  / / / / / / /"
 echo "/_____/\___/_/ /_/_/   /_/_/_/\__, /_/  /_/_/ /_/ /_/ "
 echo "                             /____/                   "
 echo ""
-echo "        IPTABLES DNAT/MASQUERADE INSTALLER         "
+echo "        3DP-MANAGER SUBSCRIPTION FORWARDER         "
 echo "==================================================="
 echo ""
-# --------------------
 
-# Запрос IP зарубежного сервера и очистка пробелов
-# Читаем ввод с терминала /dev/tty, чтобы обойти проблему с пайплайном.
+#################################
+# Определяем ORIGIN_IP
+#################################
 read -r -p "Введите IP-адрес зарубежного сервера: " FOREIGN_IP_RAW < /dev/tty
-FOREIGN_IP=$(echo "$FOREIGN_IP_RAW" | tr -d '[:space:]')
-SERVER_IP=$(hostname -I | awk '{print $1}' | tr -d '[:space:]')
+ORIGIN_IP=$(echo "$FOREIGN_IP_RAW" | tr -d '[:space:]')
+LOCAL_IP=$(hostname -I | awk '{print $1}' | tr -d '[:space:]')
 
-if [[ -z "$FOREIGN_IP" ]]; then
+if [[ -z "$ORIGIN_IP" ]]; then
     echo "Ошибка: IP-адрес не может быть пустым."
     exit 1
 fi
 
-# Запрос порта и очистка пробелов
 read -r -p "Введите номер порта, который нужно перенаправить: " PORT_RAW < /dev/tty
 PORT=$(echo "$PORT_RAW" | tr -d '[:space:]')
 
-# Простая проверка, что введено число
 if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
     echo "Ошибка: Порт должен быть числом."
     exit 1
 fi
 
-# --- 2. Получение сетевого интерфейса ---
-# Пытаемся автоматически определить основной внешний интерфейс.
-INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
+#################################
+# UFW NAT
+#################################
+if ! command -v ufw >/dev/null 2>&1; then
+    echo "UFW не установлен. Устанавливаю..."
+    apt update -qq && apt install -y ufw
+fi
 
-if [[ -z "$INTERFACE" ]]; then
-    echo "Не удалось автоматически определить внешний сетевой интерфейс."
-    echo "Возможные варианты: eth0, ens3, enp1s0. Проверьте командой 'ip a'."
-    # Читаем ввод с терминала /dev/tty.
-    read -r -p "Введите внешний интерфейс вручную (например, eth0): " INTERFACE < /dev/tty
-    if [[ -z "$INTERFACE" ]]; then
-        echo "Ошибка: Сетевой интерфейс не может быть пустым."
+if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "UFW уже активен."
+else
+    echo "ВНИМАНИЕ: UFW выключен или не настроен. Включаю..."
+    
+    ufw allow OpenSSH >/dev/null 2>&1 || true
+    
+    ufw --force enable >/dev/null 2>&1
+    
+    if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "UFW успешно включён."
+    else
+        echo "ОШИБКА: Не удалось включить UFW. Проверьте вручную!"
         exit 1
     fi
 fi
 
-echo ""
-echo "⚙️ ИСПОЛЬЗУЕМЫЕ ПАРАМЕТРЫ:"
-echo "Внешний интерфейс: $INTERFACE"
-echo "IP зарубежного сервера: $FOREIGN_IP"
-echo "Перенаправляемый порт (UDP): $PORT"
-echo "-----------------------------------"
-# Читаем ввод с терминала /dev/tty.
-read -r -p "Нажмите Enter для продолжения установки..." < /dev/tty
-
-# --- 3. Обновление пакетов и установка iptables-persistent ---
-echo ""
-echo "Шаг 1/5: Обновление пакетов и установка iptables-persistent..."
-# Обновляем
-apt update
-# Установка с автоматическим ответом "Да" на вопросы (если это возможно, -y)
-# При установке iptables-persistent, если он уже установлен, он не будет переспрашивать.
-# Если он не установлен, интерактивные вопросы могут все равно появиться, 
-# но это лучший способ сделать установку максимально автоматической.
-apt install iptables-persistent -y
-apt upgrade -y
-
-# --- 4. Включение IPv4 форвардинга ---
-echo ""
-echo "Шаг 2/5: Включение IPv4 форвардинга..."
-# Разрешаем переадресацию пакетов.
-# Используем команду, которая заменяет или добавляет, если не найдено.
-if grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-    echo "net.ipv4.ip_forward=1 уже включен в /etc/sysctl.conf."
-elif grep -q "^#net.ipv4.ip_forward=1" /etc/sysctl.conf; then
-    sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-    echo "Включено net.ipv4.ip_forward=1 в /etc/sysctl.conf."
-else
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    echo "Добавлено net.ipv4.ip_forward=1 в /etc/sysctl.conf."
-fi
-
-# Применяем изменения немедленно
-sysctl -p
-
-# --- 5. Добавление правил iptables ---
-echo ""
-echo "Шаг 3/5: Добавление правил Iptables (DNAT и MASQUERADE)..."
-
-# Очистка старых правил для этого порта (для предотвращения дублирования при повторном запуске)
-# Сначала пытаемся удалить, игнорируя ошибку, если правила не найдены
-iptables -t nat -D PREROUTING -i "$INTERFACE" -p udp --dport "$PORT" -j DNAT --to-destination "$FOREIGN_IP":"$PORT" 2>/dev/null
-iptables -t nat -D POSTROUTING -p udp -d "$FOREIGN_IP" --dport "$PORT" -j MASQUERADE 2>/dev/null
-
-# Добавление правила DNAT (Destination NAT)
-# Перенаправляет трафик, приходящий на: ваш-сервер:$PORT -> $FOREIGN_IP:$PORT
-iptables -t nat -A PREROUTING -i "$INTERFACE" -p udp --dport "$PORT" -j DNAT --to-destination "$FOREIGN_IP":"$PORT"
-echo "Добавлено правило DNAT."
-
-# Добавление правила MASQUERADE (Source NAT)
-# Подменяет исходный IP-адрес на IP вашего сервера перед отправкой на зарубежный сервер.
-iptables -t nat -A POSTROUTING -p udp -d "$FOREIGN_IP" --dport "$PORT" -j MASQUERADE
-echo "Добавлено правило MASQUERADE."
-
-# --- 6. Сохранение правил с помощью iptables-persistent ---
-echo ""
-echo "Шаг 4/5: Сохранение правил навсегда (netfilter-persistent)..."
-netfilter-persistent save
-netfilter-persistent reload
-echo "Правила сохранены в /etc/iptables/rules.v4."
-
-# --- 7. Создание и активация службы для автозапуска ---
-echo ""
-echo "Шаг 5/5: Создание и активация службы systemd для надежного автозапуска..."
-
-# Создаем файл службы
-SERVICE_FILE="/etc/systemd/system/load-nat-rules.service"
-cat << EOF > "$SERVICE_FILE"
-[Unit]
-Description=Load Custom NAT Rules After Network Up
-After=network-online.target fail2ban.service netfilter-persistent.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-# Ждем 10 секунд, чтобы сеть гарантированно поднялась
-ExecStartPre=/bin/sleep 10
-ExecStart=/bin/bash -c "/sbin/iptables-restore < /etc/iptables/rules.v4"
-StandardOutput=journal
-
-[Install]
-WantedBy=multi-user.target
+echo "--- Оптимизация сетевого стека ядра ---"
+cat <<EOF > /etc/sysctl.d/99-relay-optimization.conf
+net.ipv4.ip_forward = 1
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.netfilter.nf_conntrack_max = 2000000
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.conf.all.accept_local = 1
+net.ipv4.conf.all.route_localnet = 1
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_tw_reuse=1
 EOF
-echo "Файл службы '$SERVICE_FILE' создан."
+sysctl --system
 
-# Перезагружаем конфиг systemd и включаем автозапуск
-sudo systemctl daemon-reload
-sudo systemctl enable load-nat-rules.service
-echo "Служба 'load-nat-rules.service' включена для автозапуска."
+echo "--- Настройка правил перенаправления (before.rules) ---"
+cp /etc/ufw/before.rules /etc/ufw/before.rules.bak
 
-# --- 8. Завершение и проверка ---
-echo ""
-echo "✅ УСТАНОВКА ЗАВЕРШЕНА!"
-echo "Правила Iptables настроены и сохранены."
-echo ""
-echo "🔥 Проверьте примененные правила NAT:"
-iptables -t nat -L -n -v
+cat <<EOF > /tmp/ufw_nat_rules
+*nat
+:PREROUTING ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# Проброс портов
+-A PREROUTING -p tcp -m multiport --dports $PORT -j DNAT --to-destination $ORIGIN_IP
+-A PREROUTING -p udp -m multiport --dports $PORT -j DNAT --to-destination $ORIGIN_IP
+# Маскировка под локальный IP сервера
+-A POSTROUTING -p tcp -d $ORIGIN_IP -j SNAT --to-source $LOCAL_IP
+-A POSTROUTING -p udp -d $ORIGIN_IP -j SNAT --to-source $LOCAL_IP
+COMMIT
 
-echo ""
-echo "🚨 РЕКОМЕНДАЦИЯ: Перезагрузите сервер, чтобы убедиться, что служба автозапуска работает."
-echo "Команда: 'sudo reboot'"
-echo "В вашей конфигурации AWG поменяйте IP адрес на $SERVER_IP"
+*filter
+:FORWARD ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
 
-exit 0
+# Разрешаем пересылку для уже установленных соединений
+-A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# Явно разрешаем прохождение трафика на твой VPN сервер
+-A FORWARD -d $ORIGIN_IP -j ACCEPT
+-A FORWARD -s $ORIGIN_IP -j ACCEPT
+
+COMMIT
+
+*mangle
+:FORWARD ACCEPT [0:0]
+-A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT
+
+EOF
+
+sed -i '/\*nat/,/COMMIT/d' /etc/ufw/before.rules
+sed -i '/\*mangle/,/COMMIT/d' /etc/ufw/before.rules
+
+cat /tmp/ufw_nat_rules /etc/ufw/before.rules > /etc/ufw/before.rules.new
+mv /etc/ufw/before.rules.new /etc/ufw/before.rules
+
+echo "--- Открытие портов в фаерволе ---"
+ufw allow $PORT/tcp
+ufw allow $PORT/udp
+
+sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+
+echo "--- Перезапуск ---"
+ufw reload
+
+#################################
+# RESULT
+#################################
+echo "Готово! Система оптимизирована, порты открыты, трафик перенаправлен."
+log "Готово"
